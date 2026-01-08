@@ -89,11 +89,15 @@ impl FilesystemQuarantine {
             return Ok(());
         }
 
-        let entries = std::fs::read_dir(&meta_dir).map_err(|e| QuarantineError::RetrieveFailed {
-            reason: format!("Failed to read meta directory: {}", e),
-        })?;
+        let entries =
+            std::fs::read_dir(&meta_dir).map_err(|e| QuarantineError::RetrieveFailed {
+                reason: format!("Failed to read meta directory: {}", e),
+            })?;
 
-        let mut index = self.index.write().unwrap();
+        let mut index = self
+            .index
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
@@ -112,11 +116,10 @@ impl FilesystemQuarantine {
     /// Saves a record's metadata to disk.
     fn save_metadata(&self, record: &QuarantineRecord) -> Result<(), QuarantineError> {
         let path = self.meta_path(&record.id);
-        let content = serde_json::to_string_pretty(record).map_err(|e| {
-            QuarantineError::StoreFailed {
+        let content =
+            serde_json::to_string_pretty(record).map_err(|e| QuarantineError::StoreFailed {
                 reason: format!("Failed to serialize metadata: {}", e),
-            }
-        })?;
+            })?;
 
         std::fs::write(&path, content).map_err(|e| QuarantineError::StoreFailed {
             reason: format!("Failed to write metadata: {}", e),
@@ -178,11 +181,11 @@ impl QuarantineStore for FilesystemQuarantine {
         let data_path = self.data_path(&id);
         #[cfg(feature = "tokio-runtime")]
         {
-            tokio::fs::write(&data_path, &data)
-                .await
-                .map_err(|e| QuarantineError::StoreFailed {
+            tokio::fs::write(&data_path, &data).await.map_err(|e| {
+                QuarantineError::StoreFailed {
                     reason: format!("Failed to write data file: {}", e),
-                })?;
+                }
+            })?;
         }
         #[cfg(not(feature = "tokio-runtime"))]
         {
@@ -195,7 +198,10 @@ impl QuarantineStore for FilesystemQuarantine {
         self.save_metadata(&record)?;
 
         // Update index
-        self.index.write().unwrap().insert(id.0.clone(), record);
+        self.index
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.0.clone(), record);
 
         tracing::info!(
             quarantine_id = %id,
@@ -214,7 +220,7 @@ impl QuarantineStore for FilesystemQuarantine {
         let record = self
             .index
             .read()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&id.0)
             .cloned()
             .ok_or_else(|| QuarantineError::NotFound { id: id.to_string() })?;
@@ -222,11 +228,12 @@ impl QuarantineStore for FilesystemQuarantine {
         // Read data file
         let data_path = self.data_path(id);
         #[cfg(feature = "tokio-runtime")]
-        let data = tokio::fs::read(&data_path)
-            .await
-            .map_err(|e| QuarantineError::RetrieveFailed {
-                reason: format!("Failed to read data file: {}", e),
-            })?;
+        let data =
+            tokio::fs::read(&data_path)
+                .await
+                .map_err(|e| QuarantineError::RetrieveFailed {
+                    reason: format!("Failed to read data file: {}", e),
+                })?;
         #[cfg(not(feature = "tokio-runtime"))]
         let data = std::fs::read(&data_path).map_err(|e| QuarantineError::RetrieveFailed {
             reason: format!("Failed to read data file: {}", e),
@@ -247,7 +254,10 @@ impl QuarantineStore for FilesystemQuarantine {
 
     async fn delete(&self, id: &QuarantineId) -> Result<(), QuarantineError> {
         // Remove from index
-        self.index.write().unwrap().remove(&id.0);
+        self.index
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id.0);
 
         // Delete files
         let data_path = self.data_path(id);
@@ -273,7 +283,10 @@ impl QuarantineStore for FilesystemQuarantine {
         &self,
         filter: QuarantineFilter,
     ) -> Result<Vec<QuarantineRecord>, QuarantineError> {
-        let index = self.index.read().unwrap();
+        let index = self
+            .index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut records: Vec<_> = index
             .values()
             .filter(|r| filter.matches(r))
@@ -300,7 +313,11 @@ impl QuarantineStore for FilesystemQuarantine {
     }
 
     async fn count(&self) -> Result<usize, QuarantineError> {
-        Ok(self.index.read().unwrap().len())
+        Ok(self
+            .index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len())
     }
 }
 

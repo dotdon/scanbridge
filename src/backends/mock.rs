@@ -98,7 +98,10 @@ impl MockScanner {
 
     /// Adds a response for a specific file hash.
     pub fn with_response(self, hash: impl Into<String>, outcome: ScanOutcome) -> Self {
-        self.responses.write().unwrap().insert(hash.into(), outcome);
+        self.responses
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(hash.into(), outcome);
         self
     }
 
@@ -121,7 +124,10 @@ impl MockScanner {
 
     /// Sets the health status.
     pub fn set_healthy(&self, healthy: bool) {
-        *self.unhealthy.write().unwrap() = !healthy;
+        *self
+            .unhealthy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = !healthy;
     }
 
     /// Makes the scanner unhealthy (health checks will fail).
@@ -136,12 +142,18 @@ impl MockScanner {
 
     /// Adds a response for a specific file hash (mutable version).
     pub fn add_response(&self, hash: impl Into<String>, outcome: ScanOutcome) {
-        self.responses.write().unwrap().insert(hash.into(), outcome);
+        self.responses
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(hash.into(), outcome);
     }
 
     /// Clears all configured responses.
     pub fn clear_responses(&self) {
-        self.responses.write().unwrap().clear();
+        self.responses
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     fn should_fail(&self) -> bool {
@@ -204,7 +216,7 @@ impl Scanner for MockScanner {
         let outcome = self
             .responses
             .read()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&hash.blake3)
             .cloned()
             .unwrap_or_else(|| self.default_outcome.clone());
@@ -227,7 +239,11 @@ impl Scanner for MockScanner {
     }
 
     async fn health_check(&self) -> Result<(), ScanError> {
-        if *self.unhealthy.read().unwrap() {
+        if *self
+            .unhealthy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
             return Err(ScanError::engine_unavailable(
                 &self.name,
                 "mock scanner is unhealthy",
@@ -258,7 +274,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_scanner_infected() {
-        let threats = vec![ThreatInfo::new("Test.Malware", ThreatSeverity::High, "mock")];
+        let threats = vec![ThreatInfo::new(
+            "Test.Malware",
+            ThreatSeverity::High,
+            "mock",
+        )];
         let scanner = MockScanner::new_infected(threats);
         let input = FileInput::from_bytes(b"malicious data".to_vec());
 
@@ -290,7 +310,11 @@ mod tests {
             .with_response(
                 "known-malware-hash",
                 ScanOutcome::Infected {
-                    threats: vec![ThreatInfo::new("Known.Malware", ThreatSeverity::Critical, "mock")],
+                    threats: vec![ThreatInfo::new(
+                        "Known.Malware",
+                        ThreatSeverity::Critical,
+                        "mock",
+                    )],
                 },
             );
 

@@ -63,34 +63,58 @@ impl<S: Scanner> CircuitBreaker<S> {
 
     /// Returns the current state of the circuit breaker.
     pub fn state(&self) -> BreakerState {
-        self.state.read().unwrap().clone()
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Returns a copy of the current metrics.
     pub fn metrics(&self) -> BreakerMetrics {
-        self.metrics.read().unwrap().clone()
+        self.metrics
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Forces the circuit into the open state.
     pub fn force_open(&self) {
         let until = Instant::now() + self.config.open_duration;
-        *self.state.write().unwrap() = BreakerState::Open {
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = BreakerState::Open {
             opened_at: Instant::now(),
             until,
         };
-        self.metrics.write().unwrap().record_opened();
+        self.metrics
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_opened();
     }
 
     /// Forces the circuit into the closed state.
     pub fn force_close(&self) {
-        *self.state.write().unwrap() = BreakerState::closed();
-        self.metrics.write().unwrap().record_closed();
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = BreakerState::closed();
+        self.metrics
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_closed();
     }
 
     /// Resets the circuit breaker state and metrics.
     pub fn reset(&self) {
-        *self.state.write().unwrap() = BreakerState::closed();
-        *self.metrics.write().unwrap() = BreakerMetrics::new();
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = BreakerState::closed();
+        *self
+            .metrics
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = BreakerMetrics::new();
     }
 
     /// Returns a reference to the wrapped scanner.
@@ -105,7 +129,10 @@ impl<S: Scanner> CircuitBreaker<S> {
 
     /// Checks if a request should be allowed through.
     fn should_allow_request(&self) -> Result<(), ScanError> {
-        let mut state = self.state.write().unwrap();
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Instant::now();
 
         match &*state {
@@ -122,22 +149,19 @@ impl<S: Scanner> CircuitBreaker<S> {
                 } else {
                     Err(ScanError::CircuitOpen {
                         engine: self.inner.name().to_string(),
-                        recovery_hint: Some(format!(
-                            "Circuit may recover in {:?}",
-                            *until - now
-                        )),
+                        recovery_hint: Some(format!("Circuit may recover in {:?}", *until - now)),
                     })
                 }
             }
 
-            BreakerState::HalfOpen { probe_count, .. } => {
+            BreakerState::HalfOpen {
+                success_count,
+                probe_count,
+            } => {
                 if *probe_count < self.config.half_open_max_probes {
-                    // Allow this probe
+                    // Allow this probe - preserve the current success_count
                     *state = BreakerState::HalfOpen {
-                        success_count: state
-                            .failure_count()
-                            .map(|_| 0)
-                            .unwrap_or(0),
+                        success_count: *success_count,
                         probe_count: probe_count + 1,
                     };
                     Ok(())
@@ -153,8 +177,14 @@ impl<S: Scanner> CircuitBreaker<S> {
 
     /// Records a successful request.
     fn record_success(&self) {
-        let mut state = self.state.write().unwrap();
-        self.metrics.write().unwrap().record_success();
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.metrics
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_success();
 
         match &*state {
             BreakerState::Closed { .. } => {
@@ -162,12 +192,18 @@ impl<S: Scanner> CircuitBreaker<S> {
                 *state = BreakerState::closed();
             }
 
-            BreakerState::HalfOpen { success_count, probe_count } => {
+            BreakerState::HalfOpen {
+                success_count,
+                probe_count,
+            } => {
                 let new_success_count = success_count + 1;
                 if new_success_count >= self.config.success_threshold {
                     // Transition to closed
                     *state = BreakerState::closed();
-                    self.metrics.write().unwrap().record_closed();
+                    self.metrics
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .record_closed();
                 } else {
                     *state = BreakerState::HalfOpen {
                         success_count: new_success_count,
@@ -189,8 +225,14 @@ impl<S: Scanner> CircuitBreaker<S> {
             return;
         }
 
-        let mut state = self.state.write().unwrap();
-        self.metrics.write().unwrap().record_failure();
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.metrics
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_failure();
 
         match &*state {
             BreakerState::Closed { failure_count } => {
@@ -202,7 +244,10 @@ impl<S: Scanner> CircuitBreaker<S> {
                         opened_at: Instant::now(),
                         until,
                     };
-                    self.metrics.write().unwrap().record_opened();
+                    self.metrics
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .record_opened();
                 } else {
                     *state = BreakerState::Closed {
                         failure_count: new_count,
@@ -217,7 +262,10 @@ impl<S: Scanner> CircuitBreaker<S> {
                     opened_at: Instant::now(),
                     until,
                 };
-                self.metrics.write().unwrap().record_opened();
+                self.metrics
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record_opened();
             }
 
             BreakerState::Open { .. } => {
@@ -228,7 +276,10 @@ impl<S: Scanner> CircuitBreaker<S> {
 
     /// Handles a request when the circuit is open.
     async fn handle_open_circuit(&self, input: &FileInput) -> Result<ScanResult, ScanError> {
-        self.metrics.write().unwrap().record_rejected();
+        self.metrics
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_rejected();
 
         match &self.config.fallback_behavior {
             FallbackBehavior::FailClosed => Err(ScanError::CircuitOpen {
@@ -290,7 +341,13 @@ impl<S: Scanner> fmt::Debug for CircuitBreaker<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CircuitBreaker")
             .field("inner", &self.inner)
-            .field("state", &*self.state.read().unwrap())
+            .field(
+                "state",
+                &*self
+                    .state
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
             .field("config", &self.config)
             .finish()
     }
@@ -406,8 +463,7 @@ mod tests {
     #[tokio::test]
     async fn test_circuit_transitions_to_half_open() {
         let scanner = MockScanner::new_clean();
-        let config = CircuitBreakerConfig::default()
-            .with_open_duration(Duration::from_millis(10));
+        let config = CircuitBreakerConfig::default().with_open_duration(Duration::from_millis(10));
         let breaker = CircuitBreaker::new(scanner, config);
 
         breaker.force_open();

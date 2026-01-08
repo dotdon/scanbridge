@@ -13,8 +13,8 @@
 //! Uses the INSTREAM command to send file data for scanning.
 
 use crate::core::{
-    FileHash, FileHasher, FileInput, FileMetadata, ScanContext, ScanError, ScanOutcome,
-    ScanResult, Scanner, ThreatInfo, ThreatSeverity,
+    FileHasher, FileInput, FileMetadata, ScanContext, ScanError, ScanOutcome, ScanResult, Scanner,
+    ThreatInfo, ThreatSeverity,
 };
 
 use async_trait::async_trait;
@@ -38,6 +38,10 @@ pub struct ClamAvConfig {
 
     /// Maximum file size to send.
     pub max_file_size: u64,
+
+    /// INSTREAM chunk size (default 2048, ClamAV supports up to 2MB).
+    /// Larger chunks improve performance but may cause issues with some ClamAV versions.
+    pub chunk_size: usize,
 }
 
 impl Default for ClamAvConfig {
@@ -48,6 +52,7 @@ impl Default for ClamAvConfig {
             connection_timeout: Duration::from_secs(10),
             scan_timeout: Duration::from_secs(300),
             max_file_size: 100 * 1024 * 1024, // 100 MB
+            chunk_size: 64 * 1024, // 64 KB - good balance of performance and compatibility
         }
     }
 }
@@ -87,6 +92,13 @@ impl ClamAvConfig {
     /// Sets the maximum file size.
     pub fn with_max_file_size(mut self, size: u64) -> Self {
         self.max_file_size = size;
+        self
+    }
+
+    /// Sets the INSTREAM chunk size.
+    /// Larger chunks (up to 2MB) improve performance but may not be compatible with older ClamAV versions.
+    pub fn with_chunk_size(mut self, size: usize) -> Self {
+        self.chunk_size = size;
         self
     }
 }
@@ -167,7 +179,16 @@ impl ClamAvScanner {
             FileInput::Path(path) => {
                 #[cfg(feature = "tokio-runtime")]
                 {
-                    tokio::fs::read(path).await.map_err(ScanError::Io)
+                    // Add timeout to file read operations (30 seconds)
+                    tokio::time::timeout(std::time::Duration::from_secs(30), tokio::fs::read(path))
+                        .await
+                        .map_err(|_| {
+                            ScanError::internal(format!(
+                                "File read timeout exceeded for: {}",
+                                path.display()
+                            ))
+                        })?
+                        .map_err(ScanError::Io)
                 }
                 #[cfg(not(feature = "tokio-runtime"))]
                 {
@@ -200,49 +221,63 @@ impl ClamAvScanner {
                     "Unix sockets not supported on this platform",
                 ));
             }
-        } else if let Some(ref tcp_addr) = self.config.tcp_address {
+        } else if let Some(ref _tcp_addr) = self.config.tcp_address {
             return Err(ScanError::internal("TCP connection not yet implemented"));
         } else {
             return Err(ScanError::configuration("No connection method configured"));
         };
 
-        // Send INSTREAM command
-        #[cfg(unix)]
-        {
-            stream
-                .write_all(b"zINSTREAM\0")
-                .await
-                .map_err(|e| ScanError::connection_failed("clamav", e.to_string()))?;
+        // Perform the scan and ensure stream is closed even on error
+        let result = async {
+            // Send INSTREAM command
+            #[cfg(unix)]
+            {
+                stream
+                    .write_all(b"zINSTREAM\0")
+                    .await
+                    .map_err(|e| ScanError::connection_failed("clamav", e.to_string()))?;
 
-            // Send data in chunks
-            let chunk_size = 2048;
-            for chunk in data.chunks(chunk_size) {
-                let len = chunk.len() as u32;
+                // Send data in chunks using configured chunk size
+                for chunk in data.chunks(self.config.chunk_size) {
+                    let len = chunk.len() as u32;
+                    stream
+                        .write_all(&len.to_be_bytes())
+                        .await
+                        .map_err(|e| ScanError::connection_failed("clamav", e.to_string()))?;
+                    stream
+                        .write_all(chunk)
+                        .await
+                        .map_err(|e| ScanError::connection_failed("clamav", e.to_string()))?;
+                }
+
+                // Send zero-length chunk to end stream
                 stream
-                    .write_all(&len.to_be_bytes())
+                    .write_all(&0u32.to_be_bytes())
                     .await
                     .map_err(|e| ScanError::connection_failed("clamav", e.to_string()))?;
+
+                // Read response
+                let mut response = String::new();
                 stream
-                    .write_all(chunk)
+                    .read_to_string(&mut response)
                     .await
                     .map_err(|e| ScanError::connection_failed("clamav", e.to_string()))?;
+
+                Ok::<String, ScanError>(response)
             }
-
-            // Send zero-length chunk to end stream
-            stream
-                .write_all(&0u32.to_be_bytes())
-                .await
-                .map_err(|e| ScanError::connection_failed("clamav", e.to_string()))?;
-
-            // Read response
-            let mut response = String::new();
-            stream
-                .read_to_string(&mut response)
-                .await
-                .map_err(|e| ScanError::connection_failed("clamav", e.to_string()))?;
-
-            Ok(response)
+            #[cfg(not(unix))]
+            {
+                Err(ScanError::configuration(
+                    "Unix sockets not supported on this platform",
+                ))
+            }
         }
+        .await;
+
+        // Explicitly shutdown the stream to close the connection
+        let _ = stream.shutdown().await;
+
+        result
     }
 
     #[cfg(not(feature = "tokio-runtime"))]
@@ -351,7 +386,10 @@ mod tests {
     #[test]
     fn test_parse_response_clean() {
         let config = ClamAvConfig::new();
-        let scanner = ClamAvScanner { config, hasher: FileHasher::new() };
+        let scanner = ClamAvScanner {
+            config,
+            hasher: FileHasher::new(),
+        };
 
         let outcome = scanner.parse_response("stream: OK");
         assert!(outcome.is_clean());
@@ -360,7 +398,10 @@ mod tests {
     #[test]
     fn test_parse_response_infected() {
         let config = ClamAvConfig::new();
-        let scanner = ClamAvScanner { config, hasher: FileHasher::new() };
+        let scanner = ClamAvScanner {
+            config,
+            hasher: FileHasher::new(),
+        };
 
         let outcome = scanner.parse_response("stream: Eicar-Test-Signature FOUND");
         assert!(outcome.is_infected());
@@ -372,10 +413,7 @@ mod tests {
             .with_socket("/custom/path.sock")
             .with_scan_timeout(Duration::from_secs(60));
 
-        assert_eq!(
-            config.socket_path,
-            Some(PathBuf::from("/custom/path.sock"))
-        );
+        assert_eq!(config.socket_path, Some(PathBuf::from("/custom/path.sock")));
         assert_eq!(config.scan_timeout, Duration::from_secs(60));
     }
 }

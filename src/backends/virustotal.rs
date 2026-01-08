@@ -16,8 +16,8 @@
 //! 3. Poll for scan results
 
 use crate::core::{
-    FileHash, FileHasher, FileInput, FileMetadata, ScanContext, ScanError, ScanOutcome,
-    ScanResult, Scanner, ThreatInfo, ThreatSeverity,
+    FileHasher, FileInput, FileMetadata, ScanContext, ScanError, ScanOutcome, ScanResult, Scanner,
+    ThreatInfo, ThreatSeverity,
 };
 
 use async_trait::async_trait;
@@ -52,8 +52,15 @@ pub struct VirusTotalConfig {
 impl VirusTotalConfig {
     /// Creates a new configuration with the given API key.
     pub fn new(api_key: impl Into<String>) -> Self {
+        let key = api_key.into();
+
+        // Validate API key is not empty
+        if key.trim().is_empty() {
+            tracing::warn!("VirusTotal API key is empty - scanner will fail at runtime");
+        }
+
         Self {
-            api_key: SecretString::new(api_key.into().into()),
+            api_key: SecretString::new(key.into()),
             base_url: "https://www.virustotal.com/api/v3".to_string(),
             timeout: Duration::from_secs(60),
             max_file_size: 32 * 1024 * 1024, // 32 MB (free tier limit)
@@ -122,7 +129,9 @@ impl VirusTotalScanner {
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .build()
-            .map_err(|e| ScanError::configuration(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| {
+                ScanError::configuration(format!("Failed to create HTTP client: {}", e))
+            })?;
 
         Ok(Self {
             config,
@@ -144,7 +153,16 @@ impl VirusTotalScanner {
             FileInput::Path(path) => {
                 #[cfg(feature = "tokio-runtime")]
                 {
-                    tokio::fs::read(path).await.map_err(ScanError::Io)
+                    // Add timeout to file read operations (30 seconds)
+                    tokio::time::timeout(std::time::Duration::from_secs(30), tokio::fs::read(path))
+                        .await
+                        .map_err(|_| {
+                            ScanError::internal(format!(
+                                "File read timeout exceeded for: {}",
+                                path.display()
+                            ))
+                        })?
+                        .map_err(ScanError::Io)
                 }
                 #[cfg(not(feature = "tokio-runtime"))]
                 {
@@ -189,20 +207,24 @@ impl VirusTotalScanner {
             ));
         }
 
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| ScanError::AmbiguousResponse {
-                engine: "virustotal".to_string(),
-                details: e.to_string(),
-            })?;
+        let body: serde_json::Value =
+            response
+                .json()
+                .await
+                .map_err(|e| ScanError::AmbiguousResponse {
+                    engine: "virustotal".to_string(),
+                    details: e.to_string(),
+                })?;
 
         Ok(Some(self.parse_analysis_result(&body)?))
     }
 
     /// Parses a VirusTotal analysis result.
     #[cfg(feature = "virustotal")]
-    fn parse_analysis_result(&self, json: &serde_json::Value) -> Result<VtAnalysisResult, ScanError> {
+    fn parse_analysis_result(
+        &self,
+        json: &serde_json::Value,
+    ) -> Result<VtAnalysisResult, ScanError> {
         let stats = json
             .get("data")
             .and_then(|d| d.get("attributes"))
@@ -213,8 +235,14 @@ impl VirusTotalScanner {
             })?;
 
         let malicious = stats.get("malicious").and_then(|v| v.as_u64()).unwrap_or(0);
-        let suspicious = stats.get("suspicious").and_then(|v| v.as_u64()).unwrap_or(0);
-        let undetected = stats.get("undetected").and_then(|v| v.as_u64()).unwrap_or(0);
+        let suspicious = stats
+            .get("suspicious")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let undetected = stats
+            .get("undetected")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         let mut threats = Vec::new();
         if let Some(results) = json
@@ -298,9 +326,10 @@ impl Scanner for VirusTotalScanner {
 
             // Compute hash (including SHA256 for VT lookup)
             let hash = self.hasher.hash_bytes(&data);
-            let sha256 = hash.sha256.as_ref().ok_or_else(|| {
-                ScanError::internal("SHA256 hash required for VirusTotal")
-            })?;
+            let sha256 = hash
+                .sha256
+                .as_ref()
+                .ok_or_else(|| ScanError::internal("SHA256 hash required for VirusTotal"))?;
 
             // Try to look up by hash first
             let outcome = if let Some(result) = self.lookup_hash(sha256).await? {

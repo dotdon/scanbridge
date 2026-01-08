@@ -26,7 +26,10 @@ impl ScanHandle {
 
     /// Returns the current status of the scan.
     pub fn status(&self) -> ScanStatus {
-        self.status.read().unwrap().clone()
+        self.status
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Returns true if the scan is complete.
@@ -49,19 +52,28 @@ impl ScanHandle {
 
     /// Sets the status to in progress.
     pub(crate) fn set_in_progress(&self) {
-        *self.status.write().unwrap() = ScanStatus::InProgress;
+        *self
+            .status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ScanStatus::InProgress;
     }
 
     /// Sets the status to complete with the given result.
     pub(crate) fn set_complete(&self, result: ScanReport) {
-        *self.status.write().unwrap() = ScanStatus::Complete {
+        *self
+            .status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ScanStatus::Complete {
             result: Box::new(result),
         };
     }
 
     /// Sets the status to failed with the given error.
     pub(crate) fn set_failed(&self, error: String) {
-        *self.status.write().unwrap() = ScanStatus::Failed { error };
+        *self
+            .status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ScanStatus::Failed { error };
     }
 
     /// Waits for the scan to complete and returns the result.
@@ -148,7 +160,16 @@ impl ScanQueue {
             self.active_count.fetch_sub(1, Ordering::SeqCst);
             false
         } else {
-            self.pending_count.fetch_sub(1, Ordering::SeqCst);
+            // Only decrement pending_count if it's greater than 0 to avoid underflow
+            self.pending_count
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
+                    if val > 0 {
+                        Some(val - 1)
+                    } else {
+                        Some(0)
+                    }
+                })
+                .ok();
             true
         }
     }
